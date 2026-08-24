@@ -39,6 +39,7 @@ type Server struct {
 	Log           *log.Logger
 	mu            sync.Mutex
 	updateMu      sync.Mutex
+	backupMu      sync.Mutex
 	previews      map[string]map[string]any
 	imageChecker  func(context.Context, string) (bool, string, error)
 	githubAPIBase string
@@ -189,7 +190,7 @@ func (s *Server) serveTemplate(w http.ResponseWriter) {
 }
 func (s *Server) checkInit(w http.ResponseWriter) {
 	passkeyCount := s.Store.PasskeyCount()
-	s.json(w, 200, map[string]any{"initialized": s.Store.IsInitialized(), "password_login_enabled": s.passwordLoginEnabled(), "passkey_enabled": passkeyCount > 0, "passkey_count": passkeyCount, "brand": map[string]any{"logo_url": s.Store.GetSetting("app_logo_url", "")}})
+	s.json(w, 200, map[string]any{"initialized": s.Store.IsInitialized(), "password_login_enabled": s.passwordLoginEnabled(), "passkey_enabled": passkeyCount > 0, "passkey_count": passkeyCount, "brand": map[string]any{"name": s.Store.GetSetting("app_name", "ECS 控制台"), "logo_url": s.Store.GetSetting("app_logo_url", "")}})
 }
 
 func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
@@ -288,6 +289,10 @@ func (s *Server) authenticatedAction(w http.ResponseWriter, r *http.Request, act
 		s.uploadLogo(w, r)
 		return
 	}
+	if action == "restore_backup" {
+		s.restoreBackup(w, r)
+		return
+	}
 	if action == "passkey_register_finish" {
 		s.passkeyRegisterFinish(w, r)
 		return
@@ -298,6 +303,8 @@ func (s *Server) authenticatedAction(w http.ResponseWriter, r *http.Request, act
 		s.status(w)
 	case "get_config":
 		s.config(w)
+	case "create_backup":
+		s.createBackup(w, r, data)
 	case "passkey_register_start":
 		s.passkeyRegisterStart(w, r)
 	case "check_update":
@@ -435,7 +442,7 @@ func (s *Server) config(w http.ResponseWriter) {
 			m.used = m.fallbackUsed
 		}
 	}
-	result := map[string]any{"admin_password": "********", "admin_password_set": s.Store.IsInitialized(), "password_login_enabled": settingBool(settings["password_login_enabled"], true), "passkey_count": s.Store.PasskeyCount(), "traffic_threshold": numberString(settings["traffic_threshold"], 95), "shutdown_mode": fallback(settings["shutdown_mode"], "KeepCharging"), "threshold_action": fallback(settings["threshold_action"], "stop_and_notify"), "keep_alive": settings["keep_alive"] == "1", "monthly_auto_start": settings["monthly_auto_start"] == "1", "api_interval": numberString(settings["api_interval"], 600), "enable_billing": settings["enable_billing"] == "1", "AppBrand": map[string]any{"logo_url": settings["app_logo_url"]}, "Notification": notificationSettings(settings), "Ddns": map[string]any{"enabled": settings["ddns_enabled"] == "1", "provider": fallback(settings["ddns_provider"], "cloudflare"), "domain": settings["ddns_domain"], "cloudflare": map[string]any{"zone_id": settings["ddns_cf_zone_id"], "token": masked(settings["ddns_cf_token"]), "proxied": settings["ddns_cf_proxied"] == "1"}}, "Accounts": []any{}}
+	result := map[string]any{"admin_password": "********", "admin_password_set": s.Store.IsInitialized(), "password_login_enabled": settingBool(settings["password_login_enabled"], true), "passkey_count": s.Store.PasskeyCount(), "traffic_threshold": numberString(settings["traffic_threshold"], 95), "shutdown_mode": fallback(settings["shutdown_mode"], "KeepCharging"), "threshold_action": fallback(settings["threshold_action"], "stop_and_notify"), "keep_alive": settings["keep_alive"] == "1", "monthly_auto_start": settings["monthly_auto_start"] == "1", "api_interval": numberString(settings["api_interval"], 600), "enable_billing": settings["enable_billing"] == "1", "AppBrand": map[string]any{"name": fallback(settings["app_name"], "ECS 控制台"), "logo_url": settings["app_logo_url"]}, "Notification": notificationSettings(settings), "Ddns": map[string]any{"enabled": settings["ddns_enabled"] == "1", "provider": fallback(settings["ddns_provider"], "cloudflare"), "domain": settings["ddns_domain"], "cloudflare": map[string]any{"zone_id": settings["ddns_cf_zone_id"], "token": masked(settings["ddns_cf_token"]), "proxied": settings["ddns_cf_proxied"] == "1"}}, "Accounts": []any{}}
 	items := result["Accounts"].([]any)
 	for _, g := range groups {
 		m := metrics[g.GroupKey]
@@ -763,6 +770,16 @@ func (s *Server) saveConfig(data map[string]any) error {
 			return err
 		}
 	}
+	brandName := "ECS 控制台"
+	if brand, ok := data["AppBrand"].(map[string]any); ok {
+		brandName = strings.TrimSpace(stringValue(brand["name"]))
+		if brandName == "" {
+			brandName = "ECS 控制台"
+		}
+		if len([]rune(brandName)) > 40 {
+			return fmt.Errorf("控制台名称不能超过 40 个字符")
+		}
+	}
 	threshold := number(data["traffic_threshold"], 95)
 	if threshold < 1 || threshold > 100 {
 		return fmt.Errorf("流量阈值必须在 1 到 100 之间")
@@ -789,6 +806,7 @@ func (s *Server) saveConfig(data map[string]any) error {
 		}
 	}
 	if brand, ok := data["AppBrand"].(map[string]any); ok {
+		_ = s.Store.SetSetting("app_name", brandName)
 		_ = s.Store.SetSetting("app_logo_url", stringValue(brand["logo_url"]))
 	}
 	if ddns, ok := data["Ddns"].(map[string]any); ok {
@@ -1904,7 +1922,7 @@ func (s *Server) csrfOK(w http.ResponseWriter, r *http.Request) bool {
 }
 func (s *Server) mutating(a string) bool {
 	switch a {
-	case "save_config", "upload_logo", "clear_logs", "logout", "create_ecs", "control_instance", "delete_instance", "replace_instance_ip", "refresh_account", "sync_account_group", "sync_instances", "restore_schedule_block", "send_test_email", "send_test_telegram", "send_test_webhook", "start_update", "passkey_register_start", "passkey_register_finish":
+	case "save_config", "upload_logo", "clear_logs", "logout", "create_ecs", "control_instance", "delete_instance", "replace_instance_ip", "refresh_account", "sync_account_group", "sync_instances", "restore_schedule_block", "send_test_email", "send_test_telegram", "send_test_webhook", "start_update", "passkey_register_start", "passkey_register_finish", "create_backup", "restore_backup":
 		return true
 	}
 	return false

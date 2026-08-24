@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kori1c/ecs-controller/internal/app"
@@ -23,8 +24,9 @@ import (
 )
 
 type Store struct {
-	DB  *sql.DB
-	Key [32]byte
+	DB    *sql.DB
+	Key   [32]byte
+	keyMu sync.RWMutex
 }
 
 type Job struct {
@@ -110,6 +112,8 @@ func (s *Store) Seal(value string) (string, error) {
 	if value == "" {
 		return "", nil
 	}
+	s.keyMu.RLock()
+	defer s.keyMu.RUnlock()
 	var nonce [24]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return "", err
@@ -123,6 +127,8 @@ func (s *Store) OpenSecret(value string) (string, error) {
 	if value == "" || !strings.HasPrefix(value, "ENC1") {
 		return value, nil
 	}
+	s.keyMu.RLock()
+	defer s.keyMu.RUnlock()
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(value, "ENC1"))
 	if err != nil || len(raw) < 24 {
 		return "", fmt.Errorf("invalid encrypted value")
@@ -134,6 +140,14 @@ func (s *Store) OpenSecret(value string) (string, error) {
 		return "", fmt.Errorf("unable to decrypt value")
 	}
 	return string(plain), nil
+}
+
+// EncryptionKey returns a copy of the key used to protect stored credentials.
+// Backups include it inside the encrypted archive so a restore remains portable.
+func (s *Store) EncryptionKey() [32]byte {
+	s.keyMu.RLock()
+	defer s.keyMu.RUnlock()
+	return s.Key
 }
 
 func (s *Store) migrate() error {
