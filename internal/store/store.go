@@ -29,6 +29,8 @@ type Store struct {
 	keyMu sync.RWMutex
 }
 
+var ErrAccountNotObservable = errors.New("account cannot be marked missing")
+
 type Job struct {
 	ID          int64
 	JobID       string
@@ -168,7 +170,9 @@ func (s *Store) migrate() error {
 			private_ip TEXT DEFAULT '', cpu INTEGER DEFAULT 0, memory INTEGER DEFAULT 0, os_name TEXT DEFAULT '',
 			stopped_mode TEXT DEFAULT '', health_status TEXT DEFAULT 'Unknown', traffic_api_status TEXT DEFAULT 'ok',
 			traffic_api_message TEXT DEFAULT '', protection_suspended INTEGER DEFAULT 0,
-			protection_suspend_reason TEXT DEFAULT '', protection_suspend_notified_at INTEGER DEFAULT 0, is_deleted INTEGER DEFAULT 0
+			protection_suspend_reason TEXT DEFAULT '', protection_suspend_notified_at INTEGER DEFAULT 0,
+			last_seen_at INTEGER DEFAULT 0, missing_count INTEGER DEFAULT 0, missing_since INTEGER DEFAULT 0,
+			cloud_presence TEXT DEFAULT 'present', is_deleted INTEGER DEFAULT 0
 		)`,
 		`CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, message TEXT, created_at INTEGER)`,
 		`CREATE TABLE IF NOT EXISTS login_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT, attempt_time INTEGER)`,
@@ -226,17 +230,45 @@ func (s *Store) migrate() error {
 	for _, spec := range []struct{ table, column, definition string }{
 		{"accounts", "auto_start_blocked", "INTEGER DEFAULT 0"}, {"accounts", "schedule_last_start_date", "TEXT DEFAULT ''"}, {"accounts", "schedule_last_stop_date", "TEXT DEFAULT ''"},
 		{"accounts", "schedule_stop_active", "INTEGER DEFAULT 0"},
-		{"accounts", "schedule_blocked_by_traffic", "INTEGER DEFAULT 0"}, {"accounts", "remark", "TEXT DEFAULT ''"}, {"accounts", "site_type", "TEXT DEFAULT 'international'"}, {"accounts", "group_key", "TEXT DEFAULT ''"}, {"accounts", "instance_name", "TEXT DEFAULT ''"}, {"accounts", "instance_type", "TEXT DEFAULT ''"}, {"accounts", "internet_max_bandwidth_out", "INTEGER DEFAULT 0"}, {"accounts", "public_ip", "TEXT DEFAULT ''"}, {"accounts", "public_ip_mode", "TEXT DEFAULT 'ecs_public_ip'"}, {"accounts", "eip_allocation_id", "TEXT DEFAULT ''"}, {"accounts", "eip_address", "TEXT DEFAULT ''"}, {"accounts", "eip_managed", "INTEGER DEFAULT 0"}, {"accounts", "private_ip", "TEXT DEFAULT ''"}, {"accounts", "cpu", "INTEGER DEFAULT 0"}, {"accounts", "memory", "INTEGER DEFAULT 0"}, {"accounts", "os_name", "TEXT DEFAULT ''"}, {"accounts", "stopped_mode", "TEXT DEFAULT ''"}, {"accounts", "health_status", "TEXT DEFAULT 'Unknown'"}, {"accounts", "traffic_api_status", "TEXT DEFAULT 'ok'"}, {"accounts", "traffic_api_message", "TEXT DEFAULT ''"}, {"accounts", "protection_suspended", "INTEGER DEFAULT 0"}, {"accounts", "protection_suspend_reason", "TEXT DEFAULT ''"}, {"accounts", "protection_suspend_notified_at", "INTEGER DEFAULT 0"}, {"accounts", "is_deleted", "INTEGER DEFAULT 0"},
+		{"accounts", "schedule_blocked_by_traffic", "INTEGER DEFAULT 0"}, {"accounts", "remark", "TEXT DEFAULT ''"}, {"accounts", "site_type", "TEXT DEFAULT 'international'"}, {"accounts", "group_key", "TEXT DEFAULT ''"}, {"accounts", "instance_name", "TEXT DEFAULT ''"}, {"accounts", "instance_type", "TEXT DEFAULT ''"}, {"accounts", "internet_max_bandwidth_out", "INTEGER DEFAULT 0"}, {"accounts", "public_ip", "TEXT DEFAULT ''"}, {"accounts", "public_ip_mode", "TEXT DEFAULT 'ecs_public_ip'"}, {"accounts", "eip_allocation_id", "TEXT DEFAULT ''"}, {"accounts", "eip_address", "TEXT DEFAULT ''"}, {"accounts", "eip_managed", "INTEGER DEFAULT 0"}, {"accounts", "private_ip", "TEXT DEFAULT ''"}, {"accounts", "cpu", "INTEGER DEFAULT 0"}, {"accounts", "memory", "INTEGER DEFAULT 0"}, {"accounts", "os_name", "TEXT DEFAULT ''"}, {"accounts", "stopped_mode", "TEXT DEFAULT ''"}, {"accounts", "health_status", "TEXT DEFAULT 'Unknown'"}, {"accounts", "traffic_api_status", "TEXT DEFAULT 'ok'"}, {"accounts", "traffic_api_message", "TEXT DEFAULT ''"}, {"accounts", "protection_suspended", "INTEGER DEFAULT 0"}, {"accounts", "protection_suspend_reason", "TEXT DEFAULT ''"}, {"accounts", "protection_suspend_notified_at", "INTEGER DEFAULT 0"}, {"accounts", "last_seen_at", "INTEGER DEFAULT 0"}, {"accounts", "missing_count", "INTEGER DEFAULT 0"}, {"accounts", "missing_since", "INTEGER DEFAULT 0"}, {"accounts", "cloud_presence", "TEXT DEFAULT 'present'"}, {"accounts", "is_deleted", "INTEGER DEFAULT 0"},
 	} {
 		if err := ensureColumn(s.DB, spec.table, spec.column, spec.definition); err != nil {
 			return err
 		}
+	}
+	if err := s.ensureActiveInstanceUniqueness(); err != nil {
+		return err
 	}
 	if err := s.ResetMonthlyTraffic(); err != nil {
 		return err
 	}
 	if err := s.migratePlaintextSecrets(); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (s *Store) ensureActiveInstanceUniqueness() error {
+	// Older versions could insert the same cloud instance more than once during
+	// overlapping syncs. Keep the oldest row so traffic history remains linked
+	// to the visible account, then prevent the race from recurring.
+	_, err := s.DB.Exec(`UPDATE accounts AS duplicate
+		SET is_deleted=2,instance_status='Released',cloud_presence='retired_duplicate',access_key_secret=''
+		WHERE duplicate.is_deleted=0 AND duplicate.group_key<>'' AND duplicate.instance_id<>''
+		AND EXISTS (
+			SELECT 1 FROM accounts AS original
+			WHERE original.is_deleted=0
+			AND original.group_key=duplicate.group_key
+			AND original.instance_id=duplicate.instance_id
+			AND original.id<duplicate.id
+		)`)
+	if err != nil {
+		return fmt.Errorf("retire duplicate active instances: %w", err)
+	}
+	if _, err := s.DB.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_active_instance
+		ON accounts(group_key,instance_id)
+		WHERE is_deleted=0 AND group_key<>'' AND instance_id<>''`); err != nil {
+		return fmt.Errorf("create active instance index: %w", err)
 	}
 	return nil
 }
@@ -805,7 +837,7 @@ func (s *Store) FailJob(jobID, message string) error {
 }
 
 func (s *Store) LoadAccounts(includeDeleted bool) ([]app.Account, error) {
-	where := "WHERE is_deleted = 0"
+	where := "WHERE is_deleted = 0 AND COALESCE(cloud_presence,'present') <> 'missing'"
 	if includeDeleted {
 		where = ""
 	}
@@ -817,7 +849,8 @@ func (s *Store) LoadAccounts(includeDeleted bool) ([]app.Account, error) {
 		COALESCE(remark,''),COALESCE(site_type,'international'),COALESCE(group_key,''),COALESCE(instance_name,''),COALESCE(instance_type,''),
 		COALESCE(internet_max_bandwidth_out,0),COALESCE(public_ip,''),COALESCE(public_ip_mode,'ecs_public_ip'),COALESCE(eip_allocation_id,''),COALESCE(eip_address,''),COALESCE(eip_managed,0),
 		COALESCE(private_ip,''),COALESCE(cpu,0),COALESCE(memory,0),COALESCE(os_name,''),COALESCE(stopped_mode,''),COALESCE(health_status,'Unknown'),
-		COALESCE(traffic_api_status,'ok'),COALESCE(traffic_api_message,''),COALESCE(protection_suspended,0),COALESCE(protection_suspend_reason,''),COALESCE(protection_suspend_notified_at,0),COALESCE(is_deleted,0)
+		COALESCE(traffic_api_status,'ok'),COALESCE(traffic_api_message,''),COALESCE(protection_suspended,0),COALESCE(protection_suspend_reason,''),COALESCE(protection_suspend_notified_at,0),
+		COALESCE(last_seen_at,0),COALESCE(missing_count,0),COALESCE(missing_since,0),COALESCE(cloud_presence,'present'),COALESCE(is_deleted,0)
 		FROM accounts ` + where + ` ORDER BY COALESCE(region_id,''),COALESCE(remark,''),id`)
 	if err != nil {
 		return nil, err
@@ -827,7 +860,7 @@ func (s *Store) LoadAccounts(includeDeleted bool) ([]app.Account, error) {
 	for rows.Next() {
 		var a app.Account
 		var flags [8]int
-		err := rows.Scan(&a.ID, &a.AccessKeyID, &a.AccessKeySecret, &a.RegionID, &a.InstanceID, &a.MaxTraffic, &flags[0], &flags[1], &flags[2], &a.StartTime, &a.StopTime, &a.TrafficUsed, &a.TrafficBillingMonth, &a.InstanceStatus, &a.UpdatedAt, &a.LastKeepAliveAt, &flags[3], &a.ScheduleLastStartDate, &a.ScheduleLastStopDate, &flags[4], &flags[5], &a.Remark, &a.SiteType, &a.GroupKey, &a.InstanceName, &a.InstanceType, &a.InternetBandwidth, &a.PublicIP, &a.PublicIPMode, &a.EIPAllocationID, &a.EIPAddress, &flags[6], &a.PrivateIP, &a.CPU, &a.Memory, &a.OSName, &a.StoppedMode, &a.HealthStatus, &a.TrafficAPIStatus, &a.TrafficAPIMessage, &flags[7], &a.ProtectionSuspendReason, &a.ProtectionNotifiedAt, &a.IsDeleted)
+		err := rows.Scan(&a.ID, &a.AccessKeyID, &a.AccessKeySecret, &a.RegionID, &a.InstanceID, &a.MaxTraffic, &flags[0], &flags[1], &flags[2], &a.StartTime, &a.StopTime, &a.TrafficUsed, &a.TrafficBillingMonth, &a.InstanceStatus, &a.UpdatedAt, &a.LastKeepAliveAt, &flags[3], &a.ScheduleLastStartDate, &a.ScheduleLastStopDate, &flags[4], &flags[5], &a.Remark, &a.SiteType, &a.GroupKey, &a.InstanceName, &a.InstanceType, &a.InternetBandwidth, &a.PublicIP, &a.PublicIPMode, &a.EIPAllocationID, &a.EIPAddress, &flags[6], &a.PrivateIP, &a.CPU, &a.Memory, &a.OSName, &a.StoppedMode, &a.HealthStatus, &a.TrafficAPIStatus, &a.TrafficAPIMessage, &flags[7], &a.ProtectionSuspendReason, &a.ProtectionNotifiedAt, &a.LastSeenAt, &a.MissingCount, &a.MissingSince, &a.CloudPresence, &a.IsDeleted)
 		if err != nil {
 			return nil, err
 		}
@@ -857,6 +890,18 @@ func (s *Store) Account(id int64, includeDeleted bool) (*app.Account, error) {
 }
 
 func (s *Store) UpsertAccount(a app.Account) error {
+	if a.CloudPresence == "" {
+		a.CloudPresence = "present"
+	}
+	if a.ID == 0 && a.GroupKey != "" && a.InstanceID != "" {
+		var existingID int64
+		err := s.DB.QueryRow(`SELECT id FROM accounts WHERE is_deleted=0 AND group_key=? AND instance_id=? LIMIT 1`, a.GroupKey, a.InstanceID).Scan(&existingID)
+		if err == nil {
+			a.ID = existingID
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
 	secret, err := s.Seal(a.AccessKeySecret)
 	if err != nil {
 		return err
@@ -865,10 +910,10 @@ func (s *Store) UpsertAccount(a app.Account) error {
 	if a.ID == 0 {
 		idValue = nil
 	}
-	args := []any{idValue, a.AccessKeyID, secret, a.RegionID, a.InstanceID, a.MaxTraffic, boolInt(a.ScheduleEnabled), boolInt(a.ScheduleStartEnabled), boolInt(a.ScheduleStopEnabled), a.StartTime, a.StopTime, a.TrafficUsed, a.TrafficBillingMonth, a.InstanceStatus, a.UpdatedAt, a.LastKeepAliveAt, boolInt(a.AutoStartBlocked), a.ScheduleLastStartDate, a.ScheduleLastStopDate, boolInt(a.ScheduleStopActive), boolInt(a.ScheduleBlockedByTraffic), a.Remark, a.SiteType, a.GroupKey, a.InstanceName, a.InstanceType, a.InternetBandwidth, a.PublicIP, a.PublicIPMode, a.EIPAllocationID, a.EIPAddress, boolInt(a.EIPManaged), a.PrivateIP, a.CPU, a.Memory, a.OSName, a.StoppedMode, a.HealthStatus, a.TrafficAPIStatus, a.TrafficAPIMessage, boolInt(a.ProtectionSuspended), a.ProtectionSuspendReason, a.ProtectionNotifiedAt, a.IsDeleted}
-	columns := "id,access_key_id,access_key_secret,region_id,instance_id,max_traffic,schedule_enabled,schedule_start_enabled,schedule_stop_enabled,start_time,stop_time,traffic_used,traffic_billing_month,instance_status,updated_at,last_keep_alive_at,auto_start_blocked,schedule_last_start_date,schedule_last_stop_date,schedule_stop_active,schedule_blocked_by_traffic,remark,site_type,group_key,instance_name,instance_type,internet_max_bandwidth_out,public_ip,public_ip_mode,eip_allocation_id,eip_address,eip_managed,private_ip,cpu,memory,os_name,stopped_mode,health_status,traffic_api_status,traffic_api_message,protection_suspended,protection_suspend_reason,protection_suspend_notified_at,is_deleted"
+	args := []any{idValue, a.AccessKeyID, secret, a.RegionID, a.InstanceID, a.MaxTraffic, boolInt(a.ScheduleEnabled), boolInt(a.ScheduleStartEnabled), boolInt(a.ScheduleStopEnabled), a.StartTime, a.StopTime, a.TrafficUsed, a.TrafficBillingMonth, a.InstanceStatus, a.UpdatedAt, a.LastKeepAliveAt, boolInt(a.AutoStartBlocked), a.ScheduleLastStartDate, a.ScheduleLastStopDate, boolInt(a.ScheduleStopActive), boolInt(a.ScheduleBlockedByTraffic), a.Remark, a.SiteType, a.GroupKey, a.InstanceName, a.InstanceType, a.InternetBandwidth, a.PublicIP, a.PublicIPMode, a.EIPAllocationID, a.EIPAddress, boolInt(a.EIPManaged), a.PrivateIP, a.CPU, a.Memory, a.OSName, a.StoppedMode, a.HealthStatus, a.TrafficAPIStatus, a.TrafficAPIMessage, boolInt(a.ProtectionSuspended), a.ProtectionSuspendReason, a.ProtectionNotifiedAt, a.LastSeenAt, a.MissingCount, a.MissingSince, a.CloudPresence, a.IsDeleted}
+	columns := "id,access_key_id,access_key_secret,region_id,instance_id,max_traffic,schedule_enabled,schedule_start_enabled,schedule_stop_enabled,start_time,stop_time,traffic_used,traffic_billing_month,instance_status,updated_at,last_keep_alive_at,auto_start_blocked,schedule_last_start_date,schedule_last_stop_date,schedule_stop_active,schedule_blocked_by_traffic,remark,site_type,group_key,instance_name,instance_type,internet_max_bandwidth_out,public_ip,public_ip_mode,eip_allocation_id,eip_address,eip_managed,private_ip,cpu,memory,os_name,stopped_mode,health_status,traffic_api_status,traffic_api_message,protection_suspended,protection_suspend_reason,protection_suspend_notified_at,last_seen_at,missing_count,missing_since,cloud_presence,is_deleted"
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(args)), ",")
-	_, err = s.DB.Exec(`INSERT INTO accounts(`+columns+`) VALUES(`+placeholders+`) ON CONFLICT(id) DO UPDATE SET access_key_id=excluded.access_key_id,access_key_secret=excluded.access_key_secret,region_id=excluded.region_id,instance_id=excluded.instance_id,max_traffic=excluded.max_traffic,schedule_enabled=excluded.schedule_enabled,schedule_start_enabled=excluded.schedule_start_enabled,schedule_stop_enabled=excluded.schedule_stop_enabled,start_time=excluded.start_time,stop_time=excluded.stop_time,traffic_used=excluded.traffic_used,traffic_billing_month=excluded.traffic_billing_month,instance_status=excluded.instance_status,updated_at=excluded.updated_at,last_keep_alive_at=excluded.last_keep_alive_at,auto_start_blocked=excluded.auto_start_blocked,schedule_last_start_date=excluded.schedule_last_start_date,schedule_last_stop_date=excluded.schedule_last_stop_date,schedule_stop_active=excluded.schedule_stop_active,schedule_blocked_by_traffic=excluded.schedule_blocked_by_traffic,remark=excluded.remark,site_type=excluded.site_type,group_key=excluded.group_key,instance_name=excluded.instance_name,instance_type=excluded.instance_type,internet_max_bandwidth_out=excluded.internet_max_bandwidth_out,public_ip=excluded.public_ip,public_ip_mode=excluded.public_ip_mode,eip_allocation_id=excluded.eip_allocation_id,eip_address=excluded.eip_address,eip_managed=excluded.eip_managed,private_ip=excluded.private_ip,cpu=excluded.cpu,memory=excluded.memory,os_name=excluded.os_name,stopped_mode=excluded.stopped_mode,health_status=excluded.health_status,traffic_api_status=excluded.traffic_api_status,traffic_api_message=excluded.traffic_api_message,protection_suspended=excluded.protection_suspended,protection_suspend_reason=excluded.protection_suspend_reason,protection_suspend_notified_at=excluded.protection_suspend_notified_at,is_deleted=excluded.is_deleted`, args...)
+	_, err = s.DB.Exec(`INSERT INTO accounts(`+columns+`) VALUES(`+placeholders+`) ON CONFLICT(id) DO UPDATE SET access_key_id=excluded.access_key_id,access_key_secret=excluded.access_key_secret,region_id=excluded.region_id,instance_id=excluded.instance_id,max_traffic=excluded.max_traffic,schedule_enabled=excluded.schedule_enabled,schedule_start_enabled=excluded.schedule_start_enabled,schedule_stop_enabled=excluded.schedule_stop_enabled,start_time=excluded.start_time,stop_time=excluded.stop_time,traffic_used=excluded.traffic_used,traffic_billing_month=excluded.traffic_billing_month,instance_status=excluded.instance_status,updated_at=excluded.updated_at,last_keep_alive_at=excluded.last_keep_alive_at,auto_start_blocked=excluded.auto_start_blocked,schedule_last_start_date=excluded.schedule_last_start_date,schedule_stop_active=excluded.schedule_stop_active,schedule_last_stop_date=excluded.schedule_last_stop_date,schedule_blocked_by_traffic=excluded.schedule_blocked_by_traffic,remark=excluded.remark,site_type=excluded.site_type,group_key=excluded.group_key,instance_name=excluded.instance_name,instance_type=excluded.instance_type,internet_max_bandwidth_out=excluded.internet_max_bandwidth_out,public_ip=excluded.public_ip,public_ip_mode=excluded.public_ip_mode,eip_allocation_id=excluded.eip_allocation_id,eip_address=excluded.eip_address,eip_managed=excluded.eip_managed,private_ip=excluded.private_ip,cpu=excluded.cpu,memory=excluded.memory,os_name=excluded.os_name,stopped_mode=excluded.stopped_mode,health_status=excluded.health_status,traffic_api_status=excluded.traffic_api_status,traffic_api_message=excluded.traffic_api_message,protection_suspended=excluded.protection_suspended,protection_suspend_reason=excluded.protection_suspend_reason,protection_suspend_notified_at=excluded.protection_suspend_notified_at,last_seen_at=excluded.last_seen_at,missing_count=excluded.missing_count,missing_since=excluded.missing_since,cloud_presence=excluded.cloud_presence,is_deleted=excluded.is_deleted`, args...)
 	return err
 }
 
@@ -880,7 +925,7 @@ func boolInt(value bool) int {
 }
 
 func (s *Store) MarkDeleted(id int64) error {
-	_, err := s.DB.Exec(`UPDATE accounts SET is_deleted=1,access_key_secret='' WHERE id=?`, id)
+	_, err := s.DB.Exec(`UPDATE accounts SET is_deleted=1,cloud_presence='retired_local',access_key_secret='' WHERE id=?`, id)
 	return err
 }
 func (s *Store) MarkReleasing(id int64) error {
@@ -888,20 +933,133 @@ func (s *Store) MarkReleasing(id int64) error {
 	return err
 }
 func (s *Store) PhysicallyDelete(id int64) error {
-	_, err := s.DB.Exec(`UPDATE accounts SET is_deleted=2,instance_status='Released',access_key_secret='' WHERE id=?`, id)
-	return err
+	return s.DeleteInstanceData(id)
+}
+
+// DeleteInstanceData permanently removes one local ECS instance and every
+// instance-scoped record. Account-group settings live in settings and are not
+// touched, so the next inventory pass can discover a newly created instance.
+func (s *Store) DeleteInstanceData(id int64) error {
+	var instanceID string
+	err := s.DB.QueryRow(`SELECT COALESCE(instance_id,'') FROM accounts WHERE id=?`, id).Scan(&instanceID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	rollback := func(cause error) error {
+		_ = tx.Rollback()
+		return cause
+	}
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{`DELETE FROM traffic_hourly WHERE account_id=?`, []any{id}},
+		{`DELETE FROM traffic_daily WHERE account_id=?`, []any{id}},
+		{`DELETE FROM billing_cache WHERE account_id=?`, []any{id}},
+		{`DELETE FROM instance_traffic_usage WHERE account_id=?`, []any{id}},
+		{`DELETE FROM telegram_action_tokens WHERE account_id=?`, []any{id}},
+		{`DELETE FROM jobs WHERE entity_key=?`, []any{strconv.FormatInt(id, 10)}},
+		// Logs have no structured entity column in older databases. Remove
+		// messages containing this exact instance ID to avoid retaining its
+		// operational history after the instance is purged.
+		{`DELETE FROM logs WHERE ?<>'' AND instr(message,?)>0`, []any{instanceID, instanceID}},
+	} {
+		if _, err := tx.Exec(statement.query, statement.args...); err != nil {
+			return rollback(err)
+		}
+	}
+	if instanceID != "" {
+		if _, err := tx.Exec(`DELETE FROM ecs_create_tasks WHERE instance_id=?`, instanceID); err != nil {
+			return rollback(err)
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM accounts WHERE id=?`, id); err != nil {
+		return rollback(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // PhysicallyDeleteReleaseFailed removes only a terminal failed-release row.
 // The status guard prevents a concurrent retry from being hidden while a
 // cloud reconciliation is cleaning up an orphaned local record.
 func (s *Store) PhysicallyDeleteReleaseFailed(id int64) (bool, error) {
-	result, err := s.DB.Exec(`UPDATE accounts SET is_deleted=2,instance_status='Released',access_key_secret='' WHERE id=? AND is_deleted=0 AND instance_status='ReleaseFailed'`, id)
+	var instanceID string
+	err := s.DB.QueryRow(`SELECT COALESCE(instance_id,'') FROM accounts WHERE id=? AND is_deleted=0 AND instance_status='ReleaseFailed'`, id).Scan(&instanceID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
+	if err := s.DeleteInstanceData(id); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) ObserveAccountMissing(id int64, observedAt time.Time) (int, int64, error) {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	rollback := func(cause error) (int, int64, error) {
+		_ = tx.Rollback()
+		return 0, 0, cause
+	}
+	at := observedAt.Unix()
+	result, err := tx.Exec(`UPDATE accounts SET
+		missing_count=missing_count+1,
+		missing_since=CASE WHEN missing_since=0 THEN ? ELSE missing_since END,
+		cloud_presence='missing',instance_status='Missing',health_status='warning',
+		traffic_api_status='unknown',traffic_api_message='云端实例不存在，等待再次确认',
+		protection_suspended=1,protection_suspend_reason='instance_missing',updated_at=?
+		WHERE id=? AND is_deleted=0 AND instance_status NOT IN ('Releasing','ReleaseFailed')`, at, at, id)
+	if err != nil {
+		return rollback(err)
+	}
 	changed, err := result.RowsAffected()
-	return changed > 0, err
+	if err != nil {
+		return rollback(err)
+	}
+	if changed == 0 {
+		return rollback(ErrAccountNotObservable)
+	}
+	var count int
+	var since int64
+	if err := tx.QueryRow(`SELECT missing_count,missing_since FROM accounts WHERE id=?`, id).Scan(&count, &since); err != nil {
+		return rollback(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return count, since, nil
+}
+
+func (s *Store) RetireMissingAccount(id int64, missingBefore time.Time) (bool, error) {
+	var matched int64
+	err := s.DB.QueryRow(`SELECT id FROM accounts WHERE id=? AND is_deleted=0 AND cloud_presence='missing'
+		AND missing_count>=2 AND missing_since>0 AND missing_since<=?`, id, missingBefore.Unix()).Scan(&matched)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := s.DeleteInstanceData(matched); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) UpdateAccountStatus(id int64, traffic float64, status string, updatedAt int64, metadata map[string]any) error {

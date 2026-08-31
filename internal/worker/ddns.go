@@ -15,7 +15,7 @@ import (
 var ddnsSlugPattern = regexp.MustCompile(`[^a-z0-9]+`)
 
 func (w *Worker) syncDDNSAccount(ctx context.Context, account app.Account) {
-	if !w.ddnsEnabled() || account.InstanceID == "" {
+	if !w.ddnsEnabled() || account.InstanceID == "" || account.CloudPresence == "missing" {
 		return
 	}
 	address := account.PublicIP
@@ -50,6 +50,18 @@ func (w *Worker) deleteDDNSAccount(ctx context.Context, account app.Account, bef
 	return nil
 }
 
+func ddnsPayloadAccount(account app.Account) map[string]any {
+	return map[string]any{"GroupKey": account.GroupKey, "AccessKeyID": account.AccessKeyID, "RegionID": account.RegionID, "InstanceID": account.InstanceID, "Remark": account.Remark, "InstanceName": account.InstanceName}
+}
+
+func ddnsPayloadAccounts(accounts []app.Account) []map[string]any {
+	result := make([]map[string]any, 0, len(accounts))
+	for _, account := range accounts {
+		result = append(result, ddnsPayloadAccount(account))
+	}
+	return result
+}
+
 func (w *Worker) syncAllDDNS(ctx context.Context) {
 	if !w.ddnsEnabled() {
 		return
@@ -76,7 +88,7 @@ func (w *Worker) ddnsRecordName(account app.Account, accounts []app.Account) str
 		if key == "" {
 			key = item.AccessKeyID + "|" + item.RegionID
 		}
-		if key == groupKey && item.InstanceID != "" {
+		if key == groupKey && item.InstanceID != "" && item.CloudPresence != "missing" {
 			count++
 		}
 	}

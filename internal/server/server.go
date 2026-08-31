@@ -23,6 +23,7 @@ import (
 
 	"github.com/Kori1c/ecs-controller/internal/app"
 	"github.com/Kori1c/ecs-controller/internal/cloud"
+	"github.com/Kori1c/ecs-controller/internal/inventory"
 	"github.com/Kori1c/ecs-controller/internal/notify"
 	"github.com/Kori1c/ecs-controller/internal/store"
 )
@@ -752,7 +753,7 @@ func (s *Server) status(w http.ResponseWriter) {
 		if label == "" {
 			label = a.AccessKeyID
 		}
-		data = append(data, map[string]any{"id": a.ID, "accountId": a.ID, "instanceId": a.InstanceID, "instanceName": a.InstanceName, "instanceType": a.InstanceType, "cpu": a.CPU, "memory": a.Memory, "osName": a.OSName, "region": a.RegionID, "regionId": a.RegionID, "regionName": a.RegionID, "status": a.InstanceStatus, "instanceStatus": a.InstanceStatus, "publicIp": a.PublicIP, "privateIp": a.PrivateIP, "trafficUsed": a.TrafficUsed, "flow_used": a.TrafficUsed, "flow_total": a.MaxTraffic, "percentageOfUse": percent, "rate95": percent >= float64(numberString(s.Store.GetSetting("traffic_threshold", ""), 95)), "maxTraffic": a.MaxTraffic, "remark": a.Remark, "accountLabel": label + " / " + a.RegionID, "groupKey": a.GroupKey, "healthStatus": a.HealthStatus, "trafficStatus": a.TrafficAPIStatus, "trafficMessage": a.TrafficAPIMessage, "trafficScope": trafficScope(a.TrafficAPIStatus), "internetMaxBandwidthOut": a.InternetBandwidth, "publicIpMode": a.PublicIPMode, "eipAllocationId": a.EIPAllocationID, "eipAddress": a.EIPAddress, "eipManaged": a.EIPManaged, "operationLocked": a.IsDeleted == 1})
+		data = append(data, map[string]any{"id": a.ID, "accountId": a.ID, "instanceId": a.InstanceID, "instanceName": a.InstanceName, "instanceType": a.InstanceType, "cpu": a.CPU, "memory": a.Memory, "osName": a.OSName, "region": a.RegionID, "regionId": a.RegionID, "regionName": a.RegionID, "status": a.InstanceStatus, "instanceStatus": a.InstanceStatus, "publicIp": a.PublicIP, "privateIp": a.PrivateIP, "trafficUsed": a.TrafficUsed, "flow_used": a.TrafficUsed, "flow_total": a.MaxTraffic, "percentageOfUse": percent, "rate95": percent >= float64(numberString(s.Store.GetSetting("traffic_threshold", ""), 95)), "maxTraffic": a.MaxTraffic, "remark": a.Remark, "accountLabel": label + " / " + a.RegionID, "groupKey": a.GroupKey, "healthStatus": a.HealthStatus, "trafficStatus": a.TrafficAPIStatus, "trafficMessage": a.TrafficAPIMessage, "trafficScope": trafficScope(a.TrafficAPIStatus), "internetMaxBandwidthOut": a.InternetBandwidth, "publicIpMode": a.PublicIPMode, "eipAllocationId": a.EIPAllocationID, "eipAddress": a.EIPAddress, "eipManaged": a.EIPManaged, "cloudPresence": a.CloudPresence, "missingSince": a.MissingSince, "operationLocked": a.IsDeleted == 1 || a.CloudPresence == "missing"})
 	}
 	s.json(w, 200, map[string]any{"data": data, "system_last_run": s.Store.LastRun(), "sync_interval": numberString(s.Store.GetSetting("api_interval", ""), 600), "sensitive_visible": true})
 }
@@ -1281,6 +1282,10 @@ func (s *Server) control(w http.ResponseWriter, data map[string]any) {
 		s.error(w, 404, "账号不存在")
 		return
 	}
+	if a.CloudPresence == "missing" {
+		s.error(w, 409, "云端实例不存在，正在等待全量对账确认")
+		return
+	}
 	action := stringValue(data["action"])
 	if action != "start" && action != "stop" {
 		s.error(w, 400, "无效的操作类型")
@@ -1325,6 +1330,10 @@ func (s *Server) deleteInstance(w http.ResponseWriter, data map[string]any) {
 		s.error(w, 404, "账号不存在")
 		return
 	}
+	if a.CloudPresence == "missing" {
+		s.error(w, 409, "云端实例不存在，系统将自动归档本地记录")
+		return
+	}
 	if s.Cloud == nil && s.CloudFactory == nil {
 		s.cloudUnavailable(w)
 		return
@@ -1351,6 +1360,10 @@ func (s *Server) replaceIP(w http.ResponseWriter, data map[string]any) {
 	a, err := s.Store.Account(id, false)
 	if err != nil {
 		s.error(w, 404, "账号不存在")
+		return
+	}
+	if a.CloudPresence == "missing" {
+		s.error(w, 409, "云端实例不存在，无法更换公网 IP")
 		return
 	}
 	client := s.Cloud
@@ -1425,6 +1438,23 @@ func (s *Server) refreshAccount(w http.ResponseWriter, data map[string]any) {
 	}
 	instance, err := client.DescribeInstance(rctx(), a.RegionID, a.InstanceID)
 	if err != nil {
+		if cloud.IsNotFound(err) {
+			beforeAccounts, _ := s.Store.LoadAccounts(false)
+			if err := s.Store.DeleteInstanceData(a.ID); err != nil {
+				s.error(w, 500, "清理云端不存在实例失败: "+err.Error())
+				return
+			}
+			if s.Store.GetSetting("ddns_enabled", "0") == "1" {
+				payload := map[string]any{"account": ddnsPayloadAccount(*a), "before": ddnsPayloadAccounts(beforeAccounts)}
+				if enqueueErr := s.Store.EnqueueJob(randomToken(16), "delete_ddns", strconv.FormatInt(a.ID, 10), payload); enqueueErr != nil {
+					s.Store.AddLog("warning", "云端实例已清理，但 DDNS 清理任务入队失败: "+enqueueErr.Error())
+				}
+				_ = s.Store.SetSetting("last_ddns_reconcile", "0")
+			}
+			s.Store.AddLog("info", "手动刷新确认云端实例不存在，已彻底清理本地记录")
+			s.error(w, 404, "云端实例不存在，已从面板移除")
+			return
+		}
 		s.error(w, 400, err.Error())
 		return
 	}
@@ -1434,6 +1464,7 @@ func (s *Server) refreshAccount(w http.ResponseWriter, data map[string]any) {
 		a.PublicIP = a.EIPAddress
 	}
 	now := time.Now()
+	a.LastSeenAt, a.MissingCount, a.MissingSince, a.CloudPresence = now.Unix(), 0, 0, "present"
 	month := now.Format("2006-01")
 	endMS := now.UnixMilli()
 	a.TrafficBillingMonth = month
@@ -1582,116 +1613,8 @@ func (s *Server) syncGroup(groupKey string) (int, error) {
 	if client == nil {
 		return 0, fmt.Errorf("云客户端未配置")
 	}
-	instances, err := client.DescribeInstances(rctx(), group.RegionID)
-	if err != nil {
-		return 0, err
-	}
-	accounts, err := s.Store.LoadAccounts(true)
-	if err != nil {
-		return 0, err
-	}
-	publicNetworks := map[string]cloud.InstancePublicNetwork{}
-	publicNetworkSynced := false
-	if networkClient, ok := client.(cloud.InstancePublicNetworkClient); ok {
-		instanceIDs := make([]string, 0, len(instances))
-		for _, instance := range instances {
-			instanceIDs = append(instanceIDs, instance.ID)
-		}
-		if networks, networkErr := networkClient.DescribeInstancePublicNetworks(rctx(), group.RegionID, instanceIDs); networkErr != nil {
-			s.Log.Printf("同步实例公网带宽失败（账号组 %s）: %v", group.GroupKey, networkErr)
-		} else {
-			publicNetworks = networks
-			publicNetworkSynced = true
-		}
-	}
-	remoteIDs := make(map[string]bool, len(instances))
-	count := 0
-	for _, instance := range instances {
-		remoteIDs[instance.ID] = true
-		count++
-		var existing *app.Account
-		for i := range accounts {
-			sameGroup := accounts[i].GroupKey == group.GroupKey || (accounts[i].AccessKeyID == group.AccessKeyID && accounts[i].RegionID == group.RegionID)
-			if sameGroup && accounts[i].InstanceID == instance.ID {
-				existing = &accounts[i]
-				break
-			}
-		}
-		if existing != nil && (existing.IsDeleted != 0 || existing.InstanceStatus == "Releasing") {
-			// A user-triggered release must not be resurrected by a manual sync
-			// while the remote ECS record is still visible.
-			continue
-		}
-		a := app.Account{AccessKeyID: group.AccessKeyID, AccessKeySecret: group.AccessKeySecret, RegionID: group.RegionID, InstanceID: instance.ID, MaxTraffic: group.MaxTraffic, ScheduleEnabled: group.ScheduleEnabled, ScheduleStartEnabled: group.ScheduleStartEnabled, ScheduleStopEnabled: group.ScheduleStopEnabled, StartTime: group.StartTime, StopTime: group.StopTime, Remark: group.Remark, SiteType: group.SiteType, GroupKey: group.GroupKey, InstanceName: instance.Name, InstanceType: instance.InstanceType, InternetBandwidth: instance.InternetBandwidth, PublicIP: instance.PublicIP, PublicIPMode: "ecs_public_ip", PrivateIP: instance.PrivateIP, CPU: instance.CPU, Memory: instance.Memory, OSName: instance.OSName, InstanceStatus: instance.Status, HealthStatus: "ok", UpdatedAt: time.Now().Unix()}
-		if network, hasEIP := publicNetworks[instance.ID]; hasEIP {
-			a.PublicIPMode = "eip"
-			a.EIPAllocationID, a.EIPAddress = network.AllocationID, network.Address
-			if network.Address != "" {
-				a.PublicIP = network.Address
-			}
-			if network.Bandwidth > 0 {
-				a.InternetBandwidth = network.Bandwidth
-			}
-		}
-		if existing != nil {
-			// Keep local runtime state (traffic, schedules, protection flags and
-			// managed-network metadata) while refreshing cloud-owned fields.
-			a.ID = existing.ID
-			a.TrafficUsed, a.TrafficBillingMonth = existing.TrafficUsed, existing.TrafficBillingMonth
-			a.LastKeepAliveAt, a.AutoStartBlocked = existing.LastKeepAliveAt, existing.AutoStartBlocked
-			a.ScheduleLastStartDate, a.ScheduleLastStopDate = existing.ScheduleLastStartDate, existing.ScheduleLastStopDate
-			a.ScheduleStopActive, a.ScheduleBlockedByTraffic = existing.ScheduleStopActive, existing.ScheduleBlockedByTraffic
-			a.TrafficAPIStatus, a.TrafficAPIMessage = existing.TrafficAPIStatus, existing.TrafficAPIMessage
-			a.ProtectionSuspended, a.ProtectionSuspendReason, a.ProtectionNotifiedAt = existing.ProtectionSuspended, existing.ProtectionSuspendReason, existing.ProtectionNotifiedAt
-			if network, hasEIP := publicNetworks[instance.ID]; hasEIP {
-				// Only controller-created EIPs may be replaced from the UI.
-				a.EIPManaged = existing.EIPManaged && existing.EIPAllocationID == network.AllocationID
-			} else if !publicNetworkSynced {
-				// A failed EIP lookup must not erase known network metadata.
-				a.EIPAllocationID, a.EIPAddress, a.EIPManaged = existing.EIPAllocationID, existing.EIPAddress, existing.EIPManaged
-				a.PublicIPMode = existing.PublicIPMode
-				if a.InternetBandwidth < 1 {
-					a.InternetBandwidth = existing.InternetBandwidth
-				}
-			}
-			if a.PublicIPMode == "eip" && a.EIPAddress != "" {
-				a.PublicIP = a.EIPAddress
-			}
-		}
-		if err := s.Store.UpsertAccount(a); err != nil {
-			return count, err
-		}
-	}
-	for _, account := range accounts {
-		if account.InstanceID == "" || account.IsDeleted != 0 || remoteIDs[account.InstanceID] {
-			continue
-		}
-		sameGroup := account.GroupKey == group.GroupKey || (account.AccessKeyID == group.AccessKeyID && account.RegionID == group.RegionID)
-		if !sameGroup {
-			continue
-		}
-		if account.InstanceStatus == "ReleaseFailed" {
-			// A failed release is safe to forget only after a successful,
-			// complete DescribeInstances response confirms this exact instance ID
-			// no longer exists. Never use a reused IP address for this decision.
-			if removed, removeErr := s.Store.PhysicallyDeleteReleaseFailed(account.ID); removeErr != nil {
-				return count, removeErr
-			} else if removed {
-				s.Store.AddLog("info", "已清理云端不存在的释放失败残留记录: "+account.InstanceID)
-			}
-			continue
-		}
-		// The instance disappeared outside this controller. Route it through
-		// the same safe delete queue so EIP and DDNS cleanup still happens.
-		if err := s.Store.MarkReleasing(account.ID); err != nil {
-			return count, err
-		}
-		_ = s.Store.EnqueueJob(randomToken(16), "delete_instance", strconv.FormatInt(account.ID, 10), map[string]any{"accountId": account.ID, "forceStop": true})
-	}
-	if s.Store.GetSetting("ddns_enabled", "0") == "1" {
-		_ = s.Store.SetSetting("last_ddns_reconcile", "0")
-	}
-	return count, nil
+	result, err := inventory.SyncGroup(rctx(), s.Store, *group, client, time.Now(), s.Log.Printf)
+	return result.RemoteCount, err
 }
 
 func (s *Server) fetchInstances(w http.ResponseWriter, data map[string]any) {

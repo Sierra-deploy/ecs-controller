@@ -8097,7 +8097,12 @@
                             body: JSON.stringify({ id })
                         });
                         const data = await res.json();
-                        if (!data.success && !data.billing_error) {
+						if (!data.success && !data.billing_error) {
+							if (res.status === 404 || res.status === 409) {
+								await reloadInstanceViews({ silent: true });
+								openAlert(data.message || '云端实例不存在，已从面板移除', 'info');
+                                return;
+                            }
                             openAlert(data.message || '刷新失败', 'error');
                             return;
                         }

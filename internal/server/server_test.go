@@ -779,12 +779,56 @@ type fakeSyncClient struct {
 	publicNetworkErr error
 }
 
+type fakeMissingInstanceClient struct{ cloud.Client }
+
+func (f *fakeMissingInstanceClient) DescribeInstance(context.Context, string, string) (*cloud.Instance, error) {
+	return nil, &cloud.APIError{Code: "InvalidInstanceId.NotFound", Message: "instance not found"}
+}
+
 func (f *fakeSyncClient) DescribeInstances(context.Context, string) ([]cloud.Instance, error) {
 	return f.instances, f.describeErr
 }
 
+func (f *fakeSyncClient) DescribeInstance(_ context.Context, _ string, id string) (*cloud.Instance, error) {
+	for _, instance := range f.instances {
+		if instance.ID == id {
+			copy := instance
+			return &copy, nil
+		}
+	}
+	if f.describeErr != nil {
+		return nil, f.describeErr
+	}
+	return nil, &cloud.APIError{Code: "InvalidInstanceId.NotFound", HTTPStatus: 404}
+}
+
 func (f *fakeSyncClient) DescribeInstancePublicNetworks(context.Context, string, []string) (map[string]cloud.InstancePublicNetwork, error) {
 	return f.publicNetworks, f.publicNetworkErr
+}
+
+func TestRefreshAccountPurgesProviderMissingInstance(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.UpsertAccount(app.Account{AccessKeyID: "ak", AccessKeySecret: "sk", RegionID: "cn-test", GroupKey: "group-1", InstanceID: "i-missing", InstanceStatus: "Running"}); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(st, t.TempDir(), "", "setup-token", nil)
+	srv.CloudFactory = func(app.Account) cloud.Client { return &fakeMissingInstanceClient{} }
+	recorder := httptest.NewRecorder()
+	srv.refreshAccount(recorder, map[string]any{"accountId": 1})
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if account, err := st.Account(1, true); err == nil || account != nil {
+		t.Fatalf("missing account remained after refresh: %#v err=%v", account, err)
+	}
+	job, err := st.ClaimJob(time.Minute)
+	if err != nil || job != nil {
+		t.Fatalf("refresh queued a cloud deletion: job=%#v err=%v", job, err)
+	}
 }
 
 type fakeBillingDetailsClient struct {
@@ -881,7 +925,7 @@ func TestEnrichBillingDetailsAddsCurrentResourceWithoutChangingBillValues(t *tes
 	}
 }
 
-func TestSyncGroupPreservesReleaseAndQueuesMissingInstances(t *testing.T) {
+func TestSyncGroupPreservesReleaseAndPurgesMissingInstances(t *testing.T) {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -908,24 +952,22 @@ func TestSyncGroupPreservesReleaseAndQueuesMissingInstances(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var release, missing *app.Account
+	var release *app.Account
 	for i := range accounts {
 		switch accounts[i].InstanceID {
 		case "i-release":
 			release = &accounts[i]
-		case "i-missing":
-			missing = &accounts[i]
 		}
 	}
 	if release == nil || release.InstanceStatus != "Releasing" {
 		t.Fatalf("release state was resurrected: %#v", release)
 	}
-	if missing == nil || missing.InstanceStatus != "Releasing" {
-		t.Fatalf("missing instance was not queued: %#v", missing)
+	if _, err := st.Account(2, true); err == nil {
+		t.Fatal("missing instance remained in the database")
 	}
 	job, err := st.ClaimJob(time.Minute)
-	if err != nil || job == nil || job.EntityKey != fmt.Sprint(missing.ID) {
-		t.Fatalf("missing cleanup job: %#v %v", job, err)
+	if err != nil || job != nil {
+		t.Fatalf("external deletion unexpectedly queued a cloud release job: %#v %v", job, err)
 	}
 }
 
@@ -959,14 +1001,10 @@ func TestSyncGroupRemovesCloudMissingReleaseFailedRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var old *app.Account
-	for i := range all {
-		if all[i].InstanceID == "i-old" {
-			old = &all[i]
+	for _, account := range all {
+		if account.InstanceID == "i-old" {
+			t.Fatalf("release-failed orphan remained in the database: %#v", account)
 		}
-	}
-	if old == nil || old.IsDeleted != 2 || old.InstanceStatus != "Released" {
-		t.Fatalf("release-failed orphan was not retired: %#v", old)
 	}
 	if job, err := st.ClaimJob(time.Second); err != nil || job != nil {
 		t.Fatalf("orphan cleanup unexpectedly queued another release job: job=%#v err=%v", job, err)

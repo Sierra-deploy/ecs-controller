@@ -11,6 +11,7 @@ import (
 
 	"github.com/Kori1c/ecs-controller/internal/app"
 	"github.com/Kori1c/ecs-controller/internal/cloud"
+	"github.com/Kori1c/ecs-controller/internal/inventory"
 	"github.com/Kori1c/ecs-controller/internal/notify"
 	"github.com/Kori1c/ecs-controller/internal/store"
 )
@@ -21,6 +22,8 @@ type Worker struct {
 	CloudFactory func(app.AccountGroup) cloud.Client
 	Log          *log.Logger
 }
+
+const cloudInventoryInterval = 10 * time.Minute
 
 func cmsTrafficErrorMessage(err error) string {
 	if cloud.IsMetricNoDataError(err) {
@@ -57,6 +60,7 @@ func (w *Worker) Monitor(ctx context.Context, interval time.Duration) {
 				}
 				_ = w.Store.SetSetting("maintenance_day", maintenanceDay)
 			}
+			w.reconcileCloudInventory(ctx, now)
 			accounts, err := w.Store.LoadAccounts(false)
 			if err != nil {
 				w.Store.AddLog("error", "读取监控账号失败: "+err.Error())
@@ -87,6 +91,12 @@ func (w *Worker) Monitor(ctx context.Context, interval time.Duration) {
 				if account.InstanceID == "" {
 					continue
 				}
+				if account.CloudPresence == "missing" {
+					// Inventory reconciliation owns missing-instance confirmation.
+					// Never run keep-alive, schedules, CMS, or cloud mutations while
+					// an instance is absent from the provider inventory.
+					continue
+				}
 				client := w.Cloud
 				if w.CloudFactory != nil {
 					client = w.CloudFactory(app.AccountGroup{AccessKeyID: account.AccessKeyID, AccessKeySecret: account.AccessKeySecret, RegionID: account.RegionID, SiteType: account.SiteType})
@@ -109,6 +119,12 @@ func (w *Worker) Monitor(ctx context.Context, interval time.Duration) {
 					} else if removed {
 						continue
 					}
+					if cloud.IsNotFound(describeErr) {
+						if purgeErr := w.purgeMissingAccount(ctx, account); purgeErr != nil {
+							w.Store.AddLog("warning", "清理云端不存在实例失败: "+purgeErr.Error())
+						}
+						continue
+					}
 					metadata := map[string]any{"health_status": "error", "traffic_api_status": "unknown", "traffic_api_message": describeErr.Error()}
 					if cloud.IsCredentialError(describeErr) {
 						metadata["protection_suspended"] = true
@@ -123,6 +139,7 @@ func (w *Worker) Monitor(ctx context.Context, interval time.Duration) {
 					continue
 				}
 				account.InstanceStatus, account.PublicIP, account.PrivateIP, account.InstanceType = instance.Status, instance.PublicIP, instance.PrivateIP, instance.InstanceType
+				account.LastSeenAt, account.MissingCount, account.MissingSince, account.CloudPresence = now.Unix(), 0, 0, "present"
 				if account.PublicIPMode == "eip" && account.EIPAddress != "" {
 					account.PublicIP = account.EIPAddress
 				}
@@ -201,7 +218,47 @@ func (w *Worker) Monitor(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// cleanupMissingReleaseFailed retires a terminal local release failure after
+func (w *Worker) reconcileCloudInventory(ctx context.Context, now time.Time) {
+	groups, err := w.Store.LoadGroups()
+	if err != nil {
+		w.Store.AddLog("warning", "读取云端对账账号失败: "+err.Error())
+		return
+	}
+	for _, group := range groups {
+		attemptKey := "inventory_reconcile_attempt_" + group.GroupKey
+		lastAttempt, _ := strconv.ParseInt(w.Store.GetSetting(attemptKey, "0"), 10, 64)
+		if lastAttempt > 0 && now.Unix()-lastAttempt < int64(cloudInventoryInterval.Seconds()) {
+			continue
+		}
+		// Record attempts as well as successes so a temporary provider failure
+		// cannot turn the once-per-ten-minute inventory call into a retry storm.
+		_ = w.Store.SetSetting(attemptKey, strconv.FormatInt(now.Unix(), 10))
+		client := w.Cloud
+		if w.CloudFactory != nil {
+			client = w.CloudFactory(group)
+		}
+		if client == nil {
+			continue
+		}
+		syncCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		var logf func(string, ...any)
+		if w.Log != nil {
+			logf = w.Log.Printf
+		}
+		result, syncErr := inventory.SyncGroup(syncCtx, w.Store, group, client, now, logf)
+		cancel()
+		if syncErr != nil {
+			w.Store.AddLog("warning", fmt.Sprintf("云端实例自动对账失败 [%s/%s]: %v", group.Remark, group.RegionID, syncErr))
+			continue
+		}
+		_ = w.Store.SetSetting("inventory_reconcile_success_"+group.GroupKey, strconv.FormatInt(now.Unix(), 10))
+		if result.Purged > 0 || result.Recovered > 0 {
+			w.Store.AddLog("info", fmt.Sprintf("云端实例自动对账完成 [%s/%s]：云端 %d 台，清理 %d 台，恢复 %d 台", group.Remark, group.RegionID, result.RemoteCount, result.Purged, result.Recovered))
+		}
+	}
+}
+
+// cleanupMissingReleaseFailed removes a terminal local release failure after
 // the per-instance API confirms that the exact cloud instance is gone. This
 // deliberately does not touch EIPs or other resources because an address may
 // already have been reused by a replacement instance.
@@ -211,9 +268,29 @@ func (w *Worker) cleanupMissingReleaseFailed(account app.Account, describeErr er
 	}
 	removed, err := w.Store.PhysicallyDeleteReleaseFailed(account.ID)
 	if err == nil && removed {
-		w.Store.AddLog("info", "已清理云端不存在的释放失败残留记录: "+account.InstanceID)
+		w.Store.AddLog("info", "已清理云端不存在的释放失败残留记录")
 	}
 	return removed, err
+}
+
+func (w *Worker) purgeMissingAccount(ctx context.Context, account app.Account) error {
+	beforeAccounts, err := w.Store.LoadAccounts(false)
+	if err != nil {
+		return err
+	}
+	if err := w.Store.DeleteInstanceData(account.ID); err != nil {
+		return err
+	}
+	if w.ddnsEnabled() {
+		jobID := fmt.Sprintf("missing-ddns-%s-%d", account.InstanceID, time.Now().UnixNano())
+		payload := map[string]any{"account": ddnsPayloadAccount(account), "before": ddnsPayloadAccounts(beforeAccounts)}
+		if err := w.Store.EnqueueJob(jobID, "delete_ddns", strconv.FormatInt(account.ID, 10), payload); err != nil {
+			return fmt.Errorf("enqueue DDNS cleanup: %w", err)
+		}
+		_ = w.Store.SetSetting("last_ddns_reconcile", "0")
+	}
+	w.Store.AddLog("info", "已彻底清理云端不存在的实例记录")
+	return nil
 }
 
 func (w *Worker) protectionTraffic(ctx context.Context, client cloud.Client, account app.Account, cmsTraffic float64) (float64, string) {
